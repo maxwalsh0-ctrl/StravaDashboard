@@ -111,6 +111,22 @@ nav .nls { display:none; }
 .metric .value { font-family:var(--font-mono); font-size:23px; font-weight:600; letter-spacing:-0.02em; font-variant-numeric:tabular-nums; }
 .metric .sub { font-size:11px; color:var(--text3); margin-top:3px; }
 
+/* SPLIT BARS — animated per-lap / per-km pacing visual */
+.splitbars { margin:2px 0 14px; }
+.splitbars-head { display:flex; align-items:center; justify-content:space-between; font-size:10px; text-transform:uppercase; letter-spacing:0.07em; color:var(--text3); margin-bottom:9px; }
+.splitbars-head .sbh-legend { display:flex; gap:10px; letter-spacing:0; text-transform:none; }
+.splitbars-head .sbh-legend span { display:inline-flex; align-items:center; gap:4px; }
+.sbh-dot { width:8px; height:8px; border-radius:2px; display:inline-block; }
+.splitbar { display:grid; grid-template-columns:30px 1fr auto; align-items:center; gap:9px; margin-bottom:5px; font-family:var(--font-mono); font-size:11px; }
+.splitbar .sb-label { color:var(--text3); }
+.splitbar .sb-track { position:relative; height:13px; background:rgba(148,163,184,0.10); border-radius:5px; overflow:hidden; }
+.splitbar .sb-fill { position:absolute; inset:0 auto 0 0; width:0; border-radius:5px; transform-origin:left; transition:width 0.65s cubic-bezier(0.22,1,0.36,1); }
+.splitbar .sb-fill.fast { background:linear-gradient(90deg,#22d3ee,#0ea5e9); }
+.splitbar .sb-fill.mid  { background:linear-gradient(90deg,var(--accent),#60a5fa); }
+.splitbar .sb-fill.slow { background:linear-gradient(90deg,rgba(148,163,184,0.55),rgba(148,163,184,0.32)); }
+.splitbar .sb-val { color:var(--text2); white-space:nowrap; font-variant-numeric:tabular-nums; }
+.splitbar .sb-val .sb-hr { color:var(--text3); }
+
 /* CARDS */
 .card { background:var(--card); border:1px solid var(--border); border-radius:var(--radius-lg); padding:1.1rem 1.25rem; margin-bottom:1rem; box-shadow:var(--shadow-sm); transition:border-color 0.22s var(--ease), box-shadow 0.22s var(--ease); }
 .card:hover { border-color:var(--border2); box-shadow:var(--shadow-md); }
@@ -491,7 +507,7 @@ async function fetchRunDetail(id) {
    whether the session looks like an interval/workout effort. We hand the raw
    splits to the model and let it judge the trend (steady / fading / negative). */
 function summariseSplits(detail, summary) {
-  const out = { splitsStr: '', isWorkout: false, kind: '' };
+  const out = { splitsStr: '', isWorkout: false, kind: '', bars: [] };
   if (!detail) return out;
   const name = (summary && summary.name || '').toLowerCase();
   const wt = detail.workout_type;            // 1 race, 2 long, 3 workout/intervals
@@ -509,12 +525,29 @@ function summariseSplits(detail, summary) {
     out.isWorkout = wt === 3 || nameHints || (variedPace && laps.length >= 4);
     if (out.isWorkout) {
       out.kind = 'intervals';
-      out.splitsStr = 'Laps:\n' + laps.slice(0, 24).map((l, i) => {
+      const lapSlice = laps.slice(0, 24);
+      out.splitsStr = 'Laps:\n' + lapSlice.map((l, i) => {
         const p = l.average_speed ? secsToPace(1000 / l.average_speed) : '?';
         const d = Math.round(l.distance) + 'm';
         const hr = l.average_heartrate ? `, ${Math.round(l.average_heartrate)}bpm` : '';
         return `  Lap ${i + 1}: ${d} in ${fmtTime(l.moving_time)} @ ${p}${hr}`;
       }).join('\n');
+      // For intervals, only chart the work efforts (the fast laps) so the
+      // recovery jogs don't flatten the visual. Split laps at the median pace.
+      const sorted = [...paces].sort((a, b) => a - b);
+      const median = sorted[Math.floor(sorted.length / 2)];
+      out.bars = lapSlice.map((l, i) => {
+        const ps = l.average_speed ? 1000 / l.average_speed : null;
+        return {
+          label: 'L' + (i + 1),
+          paceSecs: ps,
+          paceStr: ps ? secsToPace(ps) : '--',
+          time: fmtTime(l.moving_time),
+          hr: l.average_heartrate ? Math.round(l.average_heartrate) : null,
+          isWork: ps != null && ps <= median + 8,
+        };
+      }).filter(b => b.isWork && b.paceSecs);
+      if (out.bars.length < 3) out.bars = []; // not a clean rep structure
       return out;
     }
   }
@@ -524,13 +557,83 @@ function summariseSplits(detail, summary) {
     if (wt === 1) out.kind = 'race';
     else if (wt === 2) out.kind = 'long run';
     else if (nameHints) { out.isWorkout = true; out.kind = 'tempo/threshold'; }
-    out.splitsStr = 'Per-km splits:\n' + splits.slice(0, 30).map((s, i) => {
+    const splitSlice = splits.slice(0, 30);
+    out.splitsStr = 'Per-km splits:\n' + splitSlice.map((s, i) => {
       const p = s.average_speed ? secsToPace(1000 / s.average_speed) : '?';
       const hr = s.average_heartrate ? `, ${Math.round(s.average_heartrate)}bpm` : '';
       return `  km ${i + 1}: ${p}${hr}`;
     }).join('\n');
+    out.bars = splitSlice.map((s, i) => {
+      const ps = s.average_speed ? 1000 / s.average_speed : null;
+      return {
+        label: 'km' + (i + 1),
+        paceSecs: ps,
+        paceStr: ps ? secsToPace(ps) : '--',
+        hr: s.average_heartrate ? Math.round(s.average_heartrate) : null,
+        isWork: out.isWorkout,
+      };
+    }).filter(b => b.paceSecs);
+    if (out.bars.length < 2) out.bars = [];
   }
   return out;
+}
+
+/* Build the animated split/lap bar visual from the structured `bars` array.
+   Bar length encodes relative pace within the run (fastest = fullest), so the
+   eye reads the workout's shape at a glance. Colour bands the top/mid/slow
+   thirds. Fills start at width 0 and grow in on the next frame, staggered. */
+function renderSplitBars(bars, isWorkout) {
+  if (!Array.isArray(bars) || bars.length < 2) return '';
+  const paces = bars.map(b => b.paceSecs);
+  const fastest = Math.min(...paces), slowest = Math.max(...paces);
+  const range = slowest - fastest || 1;
+  const rows = bars.map((b, i) => {
+    // rel: 1 = fastest in this run, 0 = slowest
+    const rel = (slowest - b.paceSecs) / range;
+    const width = Math.round(48 + rel * 52);        // 48%–100%
+    const band = rel > 0.66 ? 'fast' : rel > 0.33 ? 'mid' : 'slow';
+    const hr = b.hr ? ` <span class="sb-hr">${b.hr}</span>` : '';
+    return `<div class="splitbar">
+      <div class="sb-label">${b.label}</div>
+      <div class="sb-track"><div class="sb-fill ${band}" data-w="${width}" style="transition-delay:${i * 55}ms"></div></div>
+      <div class="sb-val">${b.paceStr}${hr}</div>
+    </div>`;
+  }).join('');
+  const title = isWorkout ? 'Rep splits' : 'Splits';
+  const legend = `<div class="sbh-legend">
+    <span><i class="sbh-dot" style="background:#22d3ee"></i>faster</span>
+    <span><i class="sbh-dot" style="background:rgba(148,163,184,0.5)"></i>slower</span>
+  </div>`;
+  return `<div class="splitbars"><div class="splitbars-head"><span>${title}</span>${legend}</div>${rows}</div>`;
+}
+
+// Kick off the grow-in once the bars are in the DOM.
+function growSplitBars(scope) {
+  requestAnimationFrame(() => {
+    scope.querySelectorAll('.sb-fill[data-w]').forEach(el => { el.style.width = el.dataset.w + '%'; });
+  });
+}
+
+// Count-up animation for numeric metric values. Elements carry data-to (target),
+// data-dp (decimal places) and optional data-suffix. Respects reduced-motion.
+function animateCounts(scope) {
+  const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  scope.querySelectorAll('.value[data-to]').forEach(el => {
+    const to = parseFloat(el.dataset.to);
+    const dp = parseInt(el.dataset.dp || '0', 10);
+    const suffix = el.dataset.suffix || '';
+    if (!isFinite(to)) return;
+    if (reduce) { el.textContent = to.toFixed(dp) + suffix; return; }
+    const dur = 850, start = performance.now();
+    const ease = t => 1 - Math.pow(1 - t, 3);
+    function frame(now) {
+      const t = Math.min(1, (now - start) / dur);
+      el.textContent = (to * ease(t)).toFixed(dp) + suffix;
+      if (t < 1) requestAnimationFrame(frame);
+      else el.textContent = to.toFixed(dp) + suffix;
+    }
+    requestAnimationFrame(frame);
+  });
 }
 
 /* Goal + planned-session context so the coach can relate the run to the plan
@@ -666,13 +769,16 @@ function renderOverview() {
   const l30 = runs.filter(r=>now-new Date(r.start_date).getTime()/1000<30*86400);
   const l30km = l30.reduce((s,r)=>s+r.distance,0)/1000;
   const overallSpeed = totalDist / totalTime; // m/s
-  document.getElementById('overview-metrics').innerHTML = `
-    <div class="metric"><div class="label">Total runs</div><div class="value">${runs.length}</div><div class="sub">all time</div></div>
-    <div class="metric"><div class="label">Total distance</div><div class="value">${(totalDist/1000).toFixed(0)}km</div><div class="sub">all time</div></div>
-    <div class="metric"><div class="label">Last 30 days</div><div class="value">${l30km.toFixed(0)}km</div><div class="sub">${l30.length} runs</div></div>
+  const elevKm = (runs.reduce((s,r)=>s+(r.total_elevation_gain||0),0)/1000).toFixed(1);
+  const om = document.getElementById('overview-metrics');
+  om.innerHTML = `
+    <div class="metric"><div class="label">Total runs</div><div class="value" data-to="${runs.length}" data-dp="0">0</div><div class="sub">all time</div></div>
+    <div class="metric"><div class="label">Total distance</div><div class="value" data-to="${(totalDist/1000).toFixed(0)}" data-dp="0" data-suffix="km">0km</div><div class="sub">all time</div></div>
+    <div class="metric"><div class="label">Last 30 days</div><div class="value" data-to="${l30km.toFixed(0)}" data-dp="0" data-suffix="km">0km</div><div class="sub">${l30.length} runs</div></div>
     <div class="metric"><div class="label">Avg pace</div><div class="value">${secsToPace(1000/overallSpeed)}</div><div class="sub">all time</div></div>
-    <div class="metric"><div class="label">Elevation</div><div class="value">${(runs.reduce((s,r)=>s+(r.total_elevation_gain||0),0)/1000).toFixed(1)}km</div><div class="sub">total climbed</div></div>
+    <div class="metric"><div class="label">Elevation</div><div class="value" data-to="${elevKm}" data-dp="1" data-suffix="km">0.0km</div><div class="sub">total climbed</div></div>
   `;
+  animateCounts(om);
   document.getElementById('recent-runs').innerHTML = allActivities.slice(0,6).map(r => {
     const [type,bc] = runBadge(r.name);
     const pace = r.average_speed ? secsToPace(1000/r.average_speed) : '--';
@@ -760,15 +866,18 @@ async function renderRunFeedback() {
     hrNote = `HR: ${avgHR} bpm avg${maxHR ? `, ${maxHR} bpm max` : ''} — ${zone}${hrVsTypical}.`;
   }
 
-  // Show static content immediately so card is always visible
-  out.innerHTML = `
-    <p class="ai-text" style="color:var(--text2);margin-bottom:12px;">${[paceNote,hrNote,elevNote].filter(Boolean).join(' ')}</p>
-    <div class="ai-typing" id="fb-typing"><span></span><span></span><span></span></div>`;
-
   // Pull splits/laps for this run so the coach can judge interval/pacing trends
   const detail = await fetchRunDetail(r.id);
   const sp = summariseSplits(detail, r);
   const ctx = coachContext(r.start_date);
+
+  // Static content: data-derived notes + animated split bars, shown immediately
+  const barsHTML = renderSplitBars(sp.bars, sp.isWorkout);
+  out.innerHTML = `
+    <p class="ai-text" style="color:var(--text2);margin-bottom:12px;">${[paceNote,hrNote,elevNote].filter(Boolean).join(' ')}</p>
+    ${barsHTML}
+    <div class="ai-typing" id="fb-typing"><span></span><span></span><span></span></div>`;
+  if (barsHTML) growSplitBars(out);
 
   // Layer AI commentary on top
   const compStr = avgSimilarPace
@@ -809,7 +918,9 @@ Be encouraging but honest and specific. Output only the sentences. No greeting, 
   try {
     const text = await claudeFetch(prompt, 'You are an experienced, perceptive running coach giving a post-session debrief. You read split and lap data closely, relate every session to the athlete’s plan and goal, and give one concrete thing to work on. Be specific, warm, direct. No bullet points, no headers.');
     document.getElementById('fb-typing')?.remove();
-    out.innerHTML = `<p class="ai-text">${text.replace(/\n\n/g,'</p><p class="ai-text" style="margin-top:10px;">').replace(/\n/g,' ')}</p>`;
+    // Append the coach commentary, keeping the data notes + animated split bars above it
+    out.insertAdjacentHTML('beforeend',
+      `<p class="ai-text" style="margin-top:2px;">${text.replace(/\n\n/g,'</p><p class="ai-text" style="margin-top:10px;">').replace(/\n/g,' ')}</p>`);
   } catch(e) {
     document.getElementById('fb-typing')?.remove();
     // Static content already visible — nothing more to do
