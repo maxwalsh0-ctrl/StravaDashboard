@@ -6,6 +6,7 @@
 const ALLOWED = [
   /^athlete$/,
   /^athlete\/activities(\?.*)?$/,
+  /^activities\/\d+(\?.*)?$/,
   /^gear\/[\w-]+$/,
 ];
 

@@ -475,6 +475,85 @@ async function stravaFetch(endpoint) {
   return r.json();
 }
 
+/* Detailed activity (laps + per-km splits + workout_type). Cached per id so
+   re-selecting a run doesn't re-hit Strava. Returns null on failure. */
+const _runDetailCache = {};
+async function fetchRunDetail(id) {
+  if (_runDetailCache[id]) return _runDetailCache[id];
+  try {
+    const d = await stravaFetch('activities/' + id);
+    _runDetailCache[id] = d;
+    return d;
+  } catch (e) { return null; }
+}
+
+/* Turn laps / km-splits into a compact, coach-readable summary and decide
+   whether the session looks like an interval/workout effort. We hand the raw
+   splits to the model and let it judge the trend (steady / fading / negative). */
+function summariseSplits(detail, summary) {
+  const out = { splitsStr: '', isWorkout: false, kind: '' };
+  if (!detail) return out;
+  const name = (summary && summary.name || '').toLowerCase();
+  const wt = detail.workout_type;            // 1 race, 2 long, 3 workout/intervals
+  const nameHints = /interval|rep|track|fartlek|session|tempo|threshold|\b\d+\s?x\s?\d|400m|800m|1k|1000m|hill/i.test(name);
+  const laps = Array.isArray(detail.laps) ? detail.laps : [];
+  const splits = Array.isArray(detail.splits_metric) ? detail.splits_metric : [];
+
+  // Laps are the natural unit for intervals. Use them when there are several
+  // and they vary in pace (i.e. work/recovery structure), or when tagged/ named
+  // as a workout.
+  if (laps.length >= 3) {
+    const paces = laps.map(l => l.average_speed ? 1000 / l.average_speed : null).filter(Boolean);
+    const fastest = Math.min(...paces), slowest = Math.max(...paces);
+    const variedPace = slowest - fastest > 25; // >25s/km spread between laps
+    out.isWorkout = wt === 3 || nameHints || (variedPace && laps.length >= 4);
+    if (out.isWorkout) {
+      out.kind = 'intervals';
+      out.splitsStr = 'Laps:\n' + laps.slice(0, 24).map((l, i) => {
+        const p = l.average_speed ? secsToPace(1000 / l.average_speed) : '?';
+        const d = Math.round(l.distance) + 'm';
+        const hr = l.average_heartrate ? `, ${Math.round(l.average_heartrate)}bpm` : '';
+        return `  Lap ${i + 1}: ${d} in ${fmtTime(l.moving_time)} @ ${p}${hr}`;
+      }).join('\n');
+      return out;
+    }
+  }
+
+  // Otherwise give per-km splits so the model can comment on pacing/fade.
+  if (splits.length >= 2) {
+    if (wt === 1) out.kind = 'race';
+    else if (wt === 2) out.kind = 'long run';
+    else if (nameHints) { out.isWorkout = true; out.kind = 'tempo/threshold'; }
+    out.splitsStr = 'Per-km splits:\n' + splits.slice(0, 30).map((s, i) => {
+      const p = s.average_speed ? secsToPace(1000 / s.average_speed) : '?';
+      const hr = s.average_heartrate ? `, ${Math.round(s.average_heartrate)}bpm` : '';
+      return `  km ${i + 1}: ${p}${hr}`;
+    }).join('\n');
+  }
+  return out;
+}
+
+/* Goal + planned-session context so the coach can relate the run to the plan
+   and the overall target. Goal is always available; the planned session is
+   included only if a week plan has been generated. */
+function coachContext(runDateStr) {
+  const goalStr = goals.length
+    ? goals.map(g => `${g.text}${g.date ? ` (target ${new Date(g.date).toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'})})` : ''}`).join('; ')
+    : 'No specific goal set';
+  let plannedStr = '';
+  if (Array.isArray(weekPlan) && weekPlan.length) {
+    const wd = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][new Date(runDateStr).getDay()];
+    const planned = weekPlan.find(d => d.day === wd);
+    if (planned && planned.type) {
+      plannedStr = `Plan for this weekday (${wd}): ${planned.type}` +
+        (planned.distance ? ` ${planned.distance}km` : '') +
+        (planned.pace ? ` @ ${planned.pace}/km` : '') +
+        (planned.detail ? ` — ${planned.detail}` : '');
+    }
+  }
+  return { goalStr, plannedStr };
+}
+
 /* ── GEMINI ── */
 // Serial queue: ensures only one request runs at a time with a gap between each
 let _geminiChain = Promise.resolve();
@@ -686,6 +765,11 @@ async function renderRunFeedback() {
     <p class="ai-text" style="color:var(--text2);margin-bottom:12px;">${[paceNote,hrNote,elevNote].filter(Boolean).join(' ')}</p>
     <div class="ai-typing" id="fb-typing"><span></span><span></span><span></span></div>`;
 
+  // Pull splits/laps for this run so the coach can judge interval/pacing trends
+  const detail = await fetchRunDetail(r.id);
+  const sp = summariseSplits(detail, r);
+  const ctx = coachContext(r.start_date);
+
   // Layer AI commentary on top
   const compStr = avgSimilarPace
     ? `Athlete avg pace for similar-distance runs: ${avgSimilarPace}/km (${similar.length} runs).`
@@ -697,17 +781,33 @@ async function renderRunFeedback() {
     `HR-to-pace ratio: ${(Math.round(r.average_heartrate) / (r.average_speed * 60)).toFixed(1)} bpm per min/km — comment on whether this suggests efficient or laboured aerobic output.`,
   ].filter(Boolean).join(' ') : 'No HR data recorded.';
 
-  const prompt = `Write 4 natural sentences as a post-run coaching observation for Max. Cover: (1) pace relative to their average, (2) a dedicated sentence on heart rate — what zone they were in, whether the HR:pace relationship looks efficient, and how it compares to their norm, (3) overall session verdict, (4) one actionable suggestion. Flowing prose only, no lists.
+  const sessionLine = sp.kind
+    ? `This looks like a ${sp.kind} session${sp.isWorkout ? ' (a hard/structured workout, not an easy run)' : ''}.`
+    : '';
+  const splitsBlock = sp.splitsStr ? `\nSplit-by-split breakdown:\n${sp.splitsStr}\n` : '';
+  const intervalGuidance = sp.isWorkout
+    ? `Because this was a workout, judge the splits directly: say whether the work efforts held steady, faded, or got faster (a negative split is a win), call out the standout rep, and give ONE concrete target to aim for next time (e.g. a pace or a "hold the last rep as fast as the first").`
+    : `Comment on how evenly it was paced and whether the effort matched the intended session type.`;
 
-Run: ${distKm.toFixed(2)}km, ${pace}/km, ${fmtDuration(r.moving_time)}. ${elevNote}
-${compStr}
+  const prompt = `Give Max a sharp post-run debrief, like an experienced coach who has just looked at his watch data. Write 4-5 natural sentences, flowing prose, no lists or headers.
+
+Cover, in order:
+1. The session in context: ${sessionLine || 'what kind of run this was'} — pace vs his usual.
+2. ${intervalGuidance}
+3. One sentence on heart rate: the zone, whether the HR-to-pace relationship looks efficient or laboured, and how it compares to his norm.
+4. How this session fits his training plan and moves him toward his goal — be specific about the goal, not generic.
+
+Run: ${distKm.toFixed(2)}km, avg ${pace}, ${fmtDuration(r.moving_time)}. ${elevNote}
+${sessionLine}${splitsBlock}${compStr}
 ${hrCtx}
+Goal(s): ${ctx.goalStr}.
+${ctx.plannedStr || 'No specific session was planned for this day.'}
 Athlete: Max, 91kg male.
 
-Output only the sentences. No greeting, no label.`;
+Be encouraging but honest and specific. Output only the sentences. No greeting, no label.`;
 
   try {
-    const text = await claudeFetch(prompt, 'You are a running coach. Be specific, warm, direct. No bullet points, no headers.');
+    const text = await claudeFetch(prompt, 'You are an experienced, perceptive running coach giving a post-session debrief. You read split and lap data closely, relate every session to the athlete’s plan and goal, and give one concrete thing to work on. Be specific, warm, direct. No bullet points, no headers.');
     document.getElementById('fb-typing')?.remove();
     out.innerHTML = `<p class="ai-text">${text.replace(/\n\n/g,'</p><p class="ai-text" style="margin-top:10px;">').replace(/\n/g,' ')}</p>`;
   } catch(e) {
@@ -767,15 +867,22 @@ async function renderLastRunAI() {
 
   const hrStr = r.average_heartrate ? `, avg HR ${Math.round(r.average_heartrate)} bpm` : '';
   const elevStr = r.total_elevation_gain ? `, +${Math.round(r.total_elevation_gain)}m elevation` : '';
-  const prompt = `Write exactly 2 sentences as a post-run coaching observation. Be specific about the pace or effort. Mention what it signals about current form.
+  const detail = await fetchRunDetail(r.id);
+  const sp = summariseSplits(detail, r);
+  const ctx = coachContext(r.start_date);
+  const sessionLine = sp.kind ? `Session type: ${sp.kind}${sp.isWorkout ? ' (structured workout)' : ''}.` : '';
+  const splitsBlock = sp.splitsStr ? `\n${sp.splitsStr}\n` : '';
+  const prompt = `Write exactly 2 sentences as a coach's quick take on this run. First sentence: what the session was and how it went${sp.isWorkout ? ' — if the splits held steady or got faster, say so and praise it; if they faded, note it gently' : ''}. Second sentence: how it fits the plan and nudges Max toward his goal (name the goal).
 
 Run: ${dateStr}, ${mToKm(r.distance)}km, ${pace}${hrStr}${elevStr}, duration ${fmtDuration(r.moving_time)}
+${sessionLine}${splitsBlock}Goal(s): ${ctx.goalStr}.
+${ctx.plannedStr || ''}
 Athlete: Max, 91kg male.
 
 Output only the 2 sentences. No greeting, no label.`;
 
   try {
-    const text = await claudeFetch(prompt, 'You are a running coach giving brief post-run feedback. Be specific, encouraging, and direct.');
+    const text = await claudeFetch(prompt, 'You are an experienced running coach giving brief, perceptive post-run feedback that always ties the session to the athlete’s plan and goal. Be specific, encouraging, and direct.');
     document.getElementById('last-run-text').innerHTML = `<p class="ai-text">${text}</p>`;
   } catch(e) {
     document.getElementById('last-run-text').innerHTML = '';
